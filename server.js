@@ -1,7 +1,12 @@
+import dns from "dns";
 import express from "express";
+import cors from "cors";
 import dotenv from "dotenv";
+import connectDB from "./config/db.js";
 import productRoutes from "./routes/productRoutes.js";
+import supabase from "./config/supabase.js";
 import orderRoutes from "./routes/orderRoutes.js";
+dns.setServers(["8.8.8.8", "8.8.4.4"]);
 
 dotenv.config();
 
