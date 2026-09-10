@@ -1,386 +1,482 @@
 import mongoose from "mongoose";
+import Order from "../models/order.js";
 import Product from "../models/product.js";
-import supabase from "../config/supabase.js";
 
-const BUCKET = "images";
+const DELIVERY_FEE = 300;
 
-const createFileName = (originalName = "product-image") => {
-  const safeName = originalName
-    .replace(/[^a-zA-Z0-9._-]/g, "-")
-    .replace(/-+/g, "-");
+const VALID_STATUSES = [
+    "Pending",
+    "Processing",
+    "Shipped",
+    "Delivered",
+    "Cancelled",
+];
 
-  return `${Date.now()}-${safeName}`;
-};
+const VALID_PAYMENT_METHODS = [
+    "Cash on Delivery",
+];
 
-const getStoragePathFromUrl = (imageUrl) => {
-  if (!imageUrl) return null;
-
-  try {
-    const marker = `/storage/v1/object/public/${BUCKET}/`;
-    const index = imageUrl.indexOf(marker);
-
-    if (index === -1) return null;
-
-    return decodeURIComponent(imageUrl.slice(index + marker.length));
-  } catch {
-    return null;
-  }
-};
-
-const deleteImageFromSupabase = async (imageUrl) => {
-  const path = getStoragePathFromUrl(imageUrl);
-
-  if (!path) return;
-
-  const { error } = await supabase.storage
-    .from(BUCKET)
-    .remove([path]);
-
-  if (error) {
-    console.error("Supabase image delete error:", error.message);
-  }
-};
-
-const parseOptionalNumber = (value) => {
-  if (value === undefined || value === null || value === "") {
-    return undefined;
-  }
-
-  const number = Number(value);
-
-  return Number.isFinite(number) ? number : undefined;
-};
-
-const parseBoolean = (value) => {
-  if (typeof value === "boolean") return value;
-  return value === "true" || value === "1" || value === "on";
-};
 
 // ==========================================
-// GET ALL PRODUCTS
+// CREATE ORDER
+// Logged-in customers only
 // ==========================================
-export const getProducts = async (req, res) => {
-  try {
-    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-    const requestedLimit = parseInt(req.query.limit, 10) || 12;
-    const limit = Math.min(Math.max(requestedLimit, 1), 100);
 
-    const skip = (page - 1) * limit;
+export const createOrder = async (req, res) => {
+    try {
+        const {
+            customer,
+            items,
+            paymentMethod,
+        } = req.body;
 
-    const [totalProducts, products] = await Promise.all([
-      Product.countDocuments(),
-      Product.find()
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit),
-    ]);
 
-    const totalPages = Math.max(Math.ceil(totalProducts / limit), 1);
+        // verifyJWT should provide req.user
 
-    res.status(200).json({
-      products,
-      currentPage: page,
-      totalPages,
-      totalProducts,
-    });
-  } catch (error) {
-    res.status(500).json({
-      message: "Failed to get products",
-      error: error.message,
-    });
-  }
-};
+        if (!req.user?._id) {
+            return res.status(401).json({
+                message: "Authentication required",
+            });
+        }
 
-// ==========================================
-// GET SINGLE PRODUCT BY ID
-// ==========================================
-export const getProductById = async (req, res) => {
-  try {
-    if (!mongoose.isValidObjectId(req.params.id)) {
-      return res.status(400).json({
-        message: "Invalid product ID",
-      });
-    }
 
-    const product = await Product.findById(req.params.id);
+        // Validate customer and items
 
-    if (!product) {
-      return res.status(404).json({
-        message: "Product not found",
-      });
-    }
+        if (
+            !customer ||
+            !Array.isArray(items) ||
+            items.length === 0
+        ) {
+            return res.status(400).json({
+                message:
+                    "Customer information and order items are required",
+            });
+        }
 
-    res.status(200).json(product);
-  } catch (error) {
-    res.status(500).json({
-      message: "Failed to get product",
-      error: error.message,
-    });
-  }
-};
 
-// ==========================================
-// CREATE PRODUCT
-// ==========================================
-export const createProduct = async (req, res) => {
-  let uploadedImageUrl = null;
+        // Email is not required from the frontend.
+        // It comes from the logged-in user.
 
-  try {
-    if (!req.file) {
-      return res.status(400).json({
-        message: "Product image is required",
-      });
-    }
+        const requiredCustomerFields = [
+            "firstName",
+            "lastName",
+            "phone",
+            "address",
+            "city",
+            "postalCode",
+        ];
 
-    const price = Number(req.body.price);
-    const oldPrice = parseOptionalNumber(req.body.oldPrice);
+        const missingField =
+            requiredCustomerFields.find((field) => {
+                return !String(
+                    customer[field] ?? ""
+                ).trim();
+            });
 
-    if (!Number.isFinite(price) || price < 0) {
-      return res.status(400).json({
-        message: "Price must be a valid positive number",
-      });
-    }
+        if (missingField) {
+            return res.status(400).json({
+                message: `${missingField} is required`,
+            });
+        }
 
-    if (oldPrice !== undefined && oldPrice < 0) {
-      return res.status(400).json({
-        message: "Old price cannot be negative",
-      });
-    }
 
-    const fileName = createFileName(req.file.originalname);
+        // Validate payment method
 
-    const { error: uploadError } = await supabase.storage
-      .from(BUCKET)
-      .upload(fileName, req.file.buffer, {
-        contentType: req.file.mimetype,
-        upsert: false,
-      });
+        const selectedPaymentMethod =
+            paymentMethod || "Cash on Delivery";
 
-    if (uploadError) {
-      return res.status(500).json({
-        message: "Failed to upload image",
-        error: uploadError.message,
-      });
-    }
+        if (
+            !VALID_PAYMENT_METHODS.includes(
+                selectedPaymentMethod
+            )
+        ) {
+            return res.status(400).json({
+                message: "Invalid payment method",
+            });
+        }
 
-    const { data: publicUrlData } = supabase.storage
-      .from(BUCKET)
-      .getPublicUrl(fileName);
 
-    uploadedImageUrl = publicUrlData?.publicUrl;
+        // Validate product IDs and quantities
 
-    if (!uploadedImageUrl) {
-      await deleteImageFromSupabase(
-        `https://placeholder/storage/v1/object/public/${BUCKET}/${fileName}`
-      );
+        for (const item of items) {
+            if (
+                !mongoose.isValidObjectId(
+                    item.productId
+                )
+            ) {
+                return res.status(400).json({
+                    message:
+                        "One or more order items have an invalid product ID",
+                });
+            }
 
-      return res.status(500).json({
-        message: "Failed to generate image URL",
-      });
-    }
+            const quantity = Number(item.quantity);
 
-    const product = await Product.create({
-      name: req.body.name?.trim(),
-      description: req.body.description?.trim(),
-      price,
-      oldPrice,
-      category: req.body.category?.trim(),
-      gender: req.body.gender,
-      brand: req.body.brand?.trim() || "NAKASA",
-      image: uploadedImageUrl,
-      featured: parseBoolean(req.body.featured),
-      rating: parseOptionalNumber(req.body.rating),
-      discount: parseOptionalNumber(req.body.discount) ?? 0,
-    });
+            if (
+                !Number.isInteger(quantity) ||
+                quantity < 1
+            ) {
+                return res.status(400).json({
+                    message:
+                        "Each product quantity must be a whole number greater than 0",
+                });
+            }
+        }
 
-    res.status(201).json({
-      message: "Product created successfully",
-      product,
-    });
-  } catch (error) {
-    if (uploadedImageUrl) {
-      await deleteImageFromSupabase(uploadedImageUrl);
-    }
 
-    if (error.name === "ValidationError" || error.name === "CastError") {
-      return res.status(400).json({
-        message: "Invalid product data",
-        error: error.message,
-      });
-    }
+        const productIds = items.map(
+            (item) => String(item.productId)
+        );
 
-    res.status(500).json({
-      message: "Failed to create product",
-      error: error.message,
-    });
-  }
-};
 
-// ==========================================
-// DELETE PRODUCT
-// ==========================================
-export const deleteProduct = async (req, res) => {
-  try {
-    if (!mongoose.isValidObjectId(req.params.id)) {
-      return res.status(400).json({
-        message: "Invalid product ID",
-      });
-    }
+        // Prevent duplicate product entries
 
-    const product = await Product.findById(req.params.id);
+        if (
+            new Set(productIds).size !==
+            productIds.length
+        ) {
+            return res.status(400).json({
+                message:
+                    "The same product cannot appear more than once",
+            });
+        }
 
-    if (!product) {
-      return res.status(404).json({
-        message: "Product not found",
-      });
-    }
 
-    await Product.findByIdAndDelete(req.params.id);
+        // Retrieve real product information from MongoDB
 
-    if (product.image) {
-      await deleteImageFromSupabase(product.image);
-    }
-
-    res.status(200).json({
-      message: "Product deleted successfully",
-      product,
-    });
-  } catch (error) {
-    res.status(500).json({
-      message: "Failed to delete product",
-      error: error.message,
-    });
-  }
-};
-
-// ==========================================
-// UPDATE PRODUCT
-// ==========================================
-export const updateProduct = async (req, res) => {
-  let newImageUrl = null;
-
-  try {
-    if (!mongoose.isValidObjectId(req.params.id)) {
-      return res.status(400).json({
-        message: "Invalid product ID",
-      });
-    }
-
-    const product = await Product.findById(req.params.id);
-
-    if (!product) {
-      return res.status(404).json({
-        message: "Product not found",
-      });
-    }
-
-    if (req.body.price !== undefined && req.body.price !== "") {
-      const price = Number(req.body.price);
-
-      if (!Number.isFinite(price) || price < 0) {
-        return res.status(400).json({
-          message: "Price must be a valid positive number",
-        });
-      }
-
-      product.price = price;
-    }
-
-    if (req.body.oldPrice !== undefined) {
-      product.oldPrice = parseOptionalNumber(req.body.oldPrice);
-    }
-
-    if (req.body.name !== undefined) {
-      product.name = req.body.name.trim();
-    }
-
-    if (req.body.description !== undefined) {
-      product.description = req.body.description.trim();
-    }
-
-    if (req.body.category !== undefined) {
-      product.category = req.body.category.trim();
-    }
-
-    if (req.body.brand !== undefined) {
-      product.brand = req.body.brand.trim() || "NAKASA";
-    }
-
-    if (req.body.gender !== undefined) {
-      product.gender = req.body.gender;
-    }
-
-    if (req.body.featured !== undefined) {
-      product.featured = parseBoolean(req.body.featured);
-    }
-
-    if (req.body.rating !== undefined) {
-      product.rating = parseOptionalNumber(req.body.rating);
-    }
-
-    if (req.body.discount !== undefined) {
-      product.discount = parseOptionalNumber(req.body.discount) ?? 0;
-    }
-
-    const oldImageUrl = product.image;
-
-    if (req.file) {
-      const fileName = createFileName(req.file.originalname);
-
-      const { error: uploadError } = await supabase.storage
-        .from(BUCKET)
-        .upload(fileName, req.file.buffer, {
-          contentType: req.file.mimetype,
-          upsert: false,
+        const products = await Product.find({
+            _id: {
+                $in: productIds,
+            },
         });
 
-      if (uploadError) {
+        if (
+            products.length !==
+            productIds.length
+        ) {
+            return res.status(400).json({
+                message:
+                    "One or more products no longer exist",
+            });
+        }
+
+
+        const productMap = new Map(
+            products.map((product) => [
+                String(product._id),
+                product,
+            ])
+        );
+
+
+        // Use product names and prices from MongoDB
+
+        const orderItems = items.map((item) => {
+            const product = productMap.get(
+                String(item.productId)
+            );
+
+            return {
+                productId: product._id,
+                name: product.name,
+                price: product.price,
+                quantity: Number(item.quantity),
+                image: product.image || "",
+            };
+        });
+
+
+        // Calculate totals on the backend
+
+        const subtotal = orderItems.reduce(
+            (sum, item) => {
+                return (
+                    sum +
+                    item.price * item.quantity
+                );
+            },
+            0
+        );
+
+        const total =
+            subtotal + DELIVERY_FEE;
+
+
+        // Create order connected to logged-in user
+
+        const order = await Order.create({
+            user: req.user._id,
+
+            customer: {
+                firstName: String(
+                    customer.firstName
+                ).trim(),
+
+                lastName: String(
+                    customer.lastName
+                ).trim(),
+
+                email: req.user.email
+                    .trim()
+                    .toLowerCase(),
+
+                phone: String(
+                    customer.phone
+                ).trim(),
+
+                address: String(
+                    customer.address
+                ).trim(),
+
+                city: String(
+                    customer.city
+                ).trim(),
+
+                postalCode: String(
+                    customer.postalCode
+                ).trim(),
+            },
+
+            items: orderItems,
+
+            subtotal,
+
+            deliveryFee: DELIVERY_FEE,
+
+            total,
+
+            paymentMethod:
+                selectedPaymentMethod,
+        });
+
+
+        return res.status(201).json({
+            message:
+                "Order created successfully",
+
+            order,
+        });
+
+    } catch (error) {
+        console.error(
+            "Create order error:",
+            error
+        );
+
         return res.status(500).json({
-          message: "Failed to upload new image",
-          error: uploadError.message,
+            message:
+                "Failed to create order",
         });
-      }
+    }
+};
 
-      const { data: publicUrlData } = supabase.storage
-        .from(BUCKET)
-        .getPublicUrl(fileName);
 
-      newImageUrl = publicUrlData?.publicUrl;
+// ==========================================
+// GET ALL ORDERS
+// Admin only
+// ==========================================
 
-      if (!newImageUrl) {
+export const getOrders = async (req, res) => {
+    try {
+        const orders = await Order.find()
+            .populate(
+                "user",
+                "firstName lastName email phone"
+            )
+            .sort({
+                createdAt: -1,
+            });
+
+        return res.status(200).json(
+            orders
+        );
+
+    } catch (error) {
+        console.error(
+            "Get orders error:",
+            error
+        );
+
         return res.status(500).json({
-          message: "Failed to generate new image URL",
+            message:
+                "Failed to get orders",
         });
-      }
-
-      product.image = newImageUrl;
     }
+};
 
-    const updatedProduct = await product.save();
 
-    if (newImageUrl && oldImageUrl) {
-      await deleteImageFromSupabase(oldImageUrl);
+// ==========================================
+// GET LOGGED-IN CUSTOMER ORDERS
+// ==========================================
+
+export const getMyOrders = async (
+    req,
+    res
+) => {
+    try {
+        if (!req.user?._id) {
+            return res.status(401).json({
+                message:
+                    "Authentication required",
+            });
+        }
+
+
+        const orders = await Order.find({
+            user: req.user._id,
+        }).sort({
+            createdAt: -1,
+        });
+
+
+        return res.status(200).json(
+            orders
+        );
+
+    } catch (error) {
+        console.error(
+            "Get my orders error:",
+            error
+        );
+
+        return res.status(500).json({
+            message:
+                "Failed to get your orders",
+        });
     }
+};
 
-    res.status(200).json({
-      message: "Product updated successfully",
-      product: updatedProduct,
-    });
-  } catch (error) {
-    if (newImageUrl) {
-      await deleteImageFromSupabase(newImageUrl);
+
+// ==========================================
+// GET SINGLE ORDER
+// Admin only with current routes
+// ==========================================
+
+export const getOrderById = async (
+    req,
+    res
+) => {
+    try {
+        if (
+            !mongoose.isValidObjectId(
+                req.params.id
+            )
+        ) {
+            return res.status(400).json({
+                message:
+                    "Invalid order ID",
+            });
+        }
+
+
+        const order = await Order.findById(
+            req.params.id
+        ).populate(
+            "user",
+            "firstName lastName email phone"
+        );
+
+
+        if (!order) {
+            return res.status(404).json({
+                message:
+                    "Order not found",
+            });
+        }
+
+
+        return res.status(200).json(
+            order
+        );
+
+    } catch (error) {
+        console.error(
+            "Get order error:",
+            error
+        );
+
+        return res.status(500).json({
+            message:
+                "Failed to get order",
+        });
     }
+};
 
-    if (error.name === "ValidationError" || error.name === "CastError") {
-      return res.status(400).json({
-        message: "Invalid product data",
-        error: error.message,
-      });
+
+// ==========================================
+// UPDATE ORDER STATUS
+// Admin only
+// ==========================================
+
+export const updateOrderStatus = async (
+    req,
+    res
+) => {
+    try {
+        if (
+            !mongoose.isValidObjectId(
+                req.params.id
+            )
+        ) {
+            return res.status(400).json({
+                message:
+                    "Invalid order ID",
+            });
+        }
+
+
+        const {
+            status,
+        } = req.body;
+
+
+        if (
+            !VALID_STATUSES.includes(status)
+        ) {
+            return res.status(400).json({
+                message:
+                    "Invalid order status",
+            });
+        }
+
+
+        const updatedOrder =
+            await Order.findByIdAndUpdate(
+                req.params.id,
+                {
+                    status,
+                },
+                {
+                    new: true,
+                    runValidators: true,
+                }
+            );
+
+
+        if (!updatedOrder) {
+            return res.status(404).json({
+                message:
+                    "Order not found",
+            });
+        }
+
+
+        return res.status(200).json({
+            message:
+                "Order status updated successfully",
+
+            order: updatedOrder,
+        });
+
+    } catch (error) {
+        console.error(
+            "Update order status error:",
+            error
+        );
+
+        return res.status(500).json({
+            message:
+                "Failed to update order status",
+        });
     }
-
-    res.status(500).json({
-      message: "Failed to update product",
-      error: error.message,
-    });
-  }
 };
