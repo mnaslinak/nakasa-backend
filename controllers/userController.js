@@ -18,7 +18,7 @@ export async function createUser(req, res) {
         } = req.body;
 
 
-        // Check required fields
+        // Validate required fields
 
         if (
             !email ||
@@ -33,10 +33,30 @@ export async function createUser(req, res) {
         }
 
 
-        // Check existing user
+        // Validate input types
+
+        if (
+            typeof email !== "string" ||
+            typeof firstName !== "string" ||
+            typeof lastName !== "string" ||
+            typeof phone !== "string" ||
+            typeof password !== "string"
+        ) {
+            return res.status(400).json({
+                message: "Invalid input data",
+            });
+        }
+
+
+        const normalizedEmail = email
+            .toLowerCase()
+            .trim();
+
+
+        // Check whether the user already exists
 
         const existingUser = await User.findOne({
-            email: email.toLowerCase(),
+            email: normalizedEmail,
         });
 
         if (existingUser) {
@@ -54,31 +74,41 @@ export async function createUser(req, res) {
         );
 
 
-        // Create user
+        // Create customer account
+        // Users cannot make themselves admins during registration
 
         const newUser = new User({
-            email: email.toLowerCase().trim(),
+            email: normalizedEmail,
             firstName: firstName.trim(),
             lastName: lastName.trim(),
             phone: phone.trim(),
             password: passwordHash,
+            isAdmin: false,
+            isBlocked: false,
         });
 
 
         await newUser.save();
 
 
-        // Success response
-
-        res.status(201).json({
+        return res.status(201).json({
             message: "User created successfully",
         });
 
     } catch (error) {
-
         console.error("Register error:", error);
 
-        res.status(500).json({
+
+        // Handle duplicate email errors from MongoDB
+
+        if (error.code === 11000) {
+            return res.status(409).json({
+                message: "User already exists",
+            });
+        }
+
+
+        return res.status(500).json({
             message: "Internal server error",
         });
     }
@@ -91,14 +121,13 @@ export async function createUser(req, res) {
 
 export async function loginUser(req, res) {
     try {
-
         const {
             email,
             password,
         } = req.body;
 
 
-        // Validate fields
+        // Validate required fields
 
         if (!email || !password) {
             return res.status(400).json({
@@ -107,25 +136,44 @@ export async function loginUser(req, res) {
         }
 
 
-        // Find user
+        // Validate input types
 
-        const user = await User.findOne({
-            email: email.toLowerCase().trim(),
-        });
-
-
-        if (!user) {
-            return res.status(404).json({
-                message: "User not found",
+        if (
+            typeof email !== "string" ||
+            typeof password !== "string"
+        ) {
+            return res.status(400).json({
+                message: "Invalid email or password",
             });
         }
 
 
-        // Check blocked user
+        const normalizedEmail = email
+            .toLowerCase()
+            .trim();
+
+
+        // Find user
+
+        const user = await User.findOne({
+            email: normalizedEmail,
+        });
+
+
+        // Use one message for both incorrect email and password
+
+        if (!user) {
+            return res.status(401).json({
+                message: "Invalid email or password",
+            });
+        }
+
+
+        // Check whether the account is blocked
 
         if (user.isBlocked) {
             return res.status(403).json({
-                message: "User is blocked",
+                message: "Your account has been blocked",
             });
         }
 
@@ -137,27 +185,31 @@ export async function loginUser(req, res) {
             user.password
         );
 
-
         if (!passwordValid) {
             return res.status(401).json({
-                message: "Invalid password",
+                message: "Invalid email or password",
             });
         }
 
 
-        // Create JWT
+        // Check JWT configuration
+
+        if (!process.env.JWT_SECRET_KEY) {
+            console.error(
+                "JWT_SECRET_KEY is not configured"
+            );
+
+            return res.status(500).json({
+                message: "Authentication configuration error",
+            });
+        }
+
+
+        // Create JWT containing only the user ID
 
         const token = jwt.sign(
             {
                 id: user._id,
-                email: user.email,
-                firstName: user.firstName,
-                lastName: user.lastName,
-                phone: user.phone,
-                isAdmin: user.isAdmin,
-                isBlocked: user.isBlocked,
-                isEmailVerified: user.isEmailVerified,
-                image: user.image,
             },
             process.env.JWT_SECRET_KEY,
             {
@@ -168,7 +220,7 @@ export async function loginUser(req, res) {
 
         // Login response
 
-        res.json({
+        return res.status(200).json({
             message: "Login successful",
 
             token,
@@ -183,15 +235,15 @@ export async function loginUser(req, res) {
                 phone: user.phone,
                 image: user.image || "",
                 isAdmin: user.isAdmin,
+                isBlocked: user.isBlocked,
                 isEmailVerified: user.isEmailVerified,
             },
         });
 
     } catch (error) {
-
         console.error("Login error:", error);
 
-        res.status(500).json({
+        return res.status(500).json({
             message: "Internal server error",
         });
     }
